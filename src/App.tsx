@@ -1,7 +1,7 @@
 import { listTemplates, createTemplate, type TimeTemplate, type TemplateValues } from '@/lib/templates'
 import { ClockTimePicker } from '@/components/ClockTimePicker'
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { buildTimeEntries, postTimeEntry, getTimeEntry, TIME_ENTRY_API, type TimeEntryDetail, type TimePayload } from '@/lib/time-entry'
+import { buildTiempos, saveTiempo, getTiempo, lockReason, backupWarning, TIME_ENTRY_API, CALENDAR_URL, DESCRIPCION_MAX, type Tiempo, type TiempoPayload } from '@/lib/time-entry'
 // import TimeEntryLogo from '@/assets/TimeEntryLogo.png'
 import { Card } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
@@ -53,8 +53,6 @@ import { Calendar } from '@/components/ui/calendar'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
 import 'animate.css'
-import { Lottie } from 'lottie-react'
-import clockAnimation from './assets/clock-lottie.json'
 import { StatusModal, type StatusModalType } from '@/components/StatusModal'
 import { Toaster, toast } from 'sonner'
 
@@ -162,7 +160,7 @@ function TimePickerPopover({
           <div className="bg-slate-50 rounded-xl p-4 w-full md:w-[130px] border border-slate-100 flex flex-col">
             <div className="text-center text-[10px] font-bold mb-4 text-slate-500 uppercase tracking-widest">Incrementos</div>
             <div className="flex flex-row md:flex-col gap-2 md:gap-2.5 flex-1 justify-center">
-              {['0.55', '0.50', '0.75', '0.00'].map(inc => (
+              {['0.25', '0.50', '0.75', '0.00'].map(inc => (
                 <button
                   key={inc}
                   onClick={() => setIncrement(inc)}
@@ -224,8 +222,8 @@ function App() {
     document.documentElement.className = theme === 'default' ? '' : theme
   }, [theme])
 
-  const [editId] = useState(() => new URLSearchParams(window.location.search).get('time_entry_id'))
-  const [editDetail, setEditDetail] = useState<TimeEntryDetail | null>(null)
+  const [editId] = useState(() => new URLSearchParams(window.location.search).get('tiempo_id'))
+  const [editDetail, setEditDetail] = useState<Tiempo | null>(null)
   const [editError, setEditError] = useState('')
   const [editReady, setEditReady] = useState(false)
   const editProject = useRef<string | null>(null)
@@ -239,13 +237,12 @@ function App() {
   const [templateKey, setTemplateKey] = useState('')
   const [applyingTemplate, setApplyingTemplate] = useState(false)
   const templateProject = useRef<string | null>(null)
-  const [reference, setReference] = useState('')
   const [isSaving, setIsSaving] = useState(false)
   const [saveBlocked, setSaveBlocked] = useState(false)
   const [hasPendingSave, setHasPendingSave] = useState(false)
   const savingRef = useRef(false)
   const savedFingerprint = useRef('')
-  const pendingSave = useRef<{ organizationId: string; fingerprint: string; entries: TimePayload[]; ids: string[]; template?: TemplateValues } | null>(null)
+  const pendingSave = useRef<{ organizationId: string; fingerprint: string; entries: TiempoPayload[]; saved: Tiempo[]; template?: TemplateValues } | null>(null)
   const [date, setDate] = useState<Date>(new Date())
   const [billableTime, setBillableTime] = useState('0.00')
   const [nonBillableTime, setNonBillableTime] = useState<string>('0.00')
@@ -375,7 +372,7 @@ function App() {
   const [startTime, setStartTime] = useState('')
   const [endTime, setEndTime] = useState('')
 
-  const [tasks, setTasks] = useState<Array<{ id: string; cf_nombre: string; cf_nombre_ingl_s: string }>>([])
+  const [tasks, setTasks] = useState<Array<{ id: string; nombre: string; codigo_utbms: string | null; facturable: number }>>([])
   const [isTasksLoading, setIsTasksLoading] = useState(false)
   const [tasksError, setTasksError] = useState('')
   const [tasksReload, setTasksReload] = useState(0)
@@ -394,7 +391,7 @@ function App() {
   }, [clientes, clienteSearch])
 
   // Proyectos State
-  const [proyectos, setProyectos] = useState<Array<{ ID: string; zoho_id: string | null; display: string }>>([])
+  const [proyectos, setProyectos] = useState<Array<{ ID: string; zoho_id: string | null; display: string; tipo_cobro: string }>>([])
   const [selectedProyecto, setSelectedProyecto] = useState<string>('')
   const [isProyectosLoading, setIsProyectosLoading] = useState(false)
   const [proyectoSearch, setProyectoSearch] = useState('')
@@ -433,7 +430,7 @@ function App() {
       }
 
       if (!useCache) {
-        const response = await fetch(`https://timeentryforaptusfinancials-730085095.development.catalystserverless.com/server/time_entry_services/${orgId}/proyectos`)
+        const response = await fetch(`${TIME_ENTRY_API}/${encodeURIComponent(orgId)}/proyectos`)
         if (!response.ok) throw new Error(`Error HTTP: ${response.status}`)
         allProjects = await response.json()
         localStorage.setItem(fullCacheKey, JSON.stringify(allProjects))
@@ -444,7 +441,8 @@ function App() {
       const mapped = filtered.map((r: any) => ({
         ID: String(r.id),
         zoho_id: r.zoho_id == null ? null : String(r.zoho_id),
-        display: r.nombre
+        display: r.nombre_completo || r.nombre,
+        tipo_cobro: r.tipo_cobro || 'horas',
       }))
       setProyectos(mapped)
       if (templateProject.current) {
@@ -453,7 +451,7 @@ function App() {
         else throw new Error('Proyecto de plantilla no disponible.')
       }
       if (editProject.current) {
-        const match = mapped.find((p: { zoho_id: string | null }) => p.zoho_id === editProject.current)
+        const match = mapped.find((p: { ID: string }) => p.ID === editProject.current)
         if (match) { setSelectedProyecto(match.ID); setEditReady(true); editProject.current = null }
         else setEditError('El proyecto del tiempo no está disponible en el catálogo de este cliente.')
       }
@@ -523,7 +521,7 @@ function App() {
     setIsAbogadosLoading(true)
 
     try {
-      const response = await fetch(`https://timeentryforaptusfinancials-730085095.development.catalystserverless.com/server/time_entry_services/${orgId}/abogados`)
+      const response = await fetch(`${TIME_ENTRY_API}/${encodeURIComponent(orgId)}/abogados`)
       if (!response.ok) throw new Error(`Error HTTP: ${response.status}`)
       const data = await response.json()
 
@@ -580,7 +578,7 @@ function App() {
     setIsClientesLoading(true)
 
     try {
-      const response = await fetch(`https://timeentryforaptusfinancials-730085095.development.catalystserverless.com/server/time_entry_services/${orgId}/clientes`)
+      const response = await fetch(`${TIME_ENTRY_API}/${encodeURIComponent(orgId)}/clientes`)
 
       if (!response.ok) {
         throw new Error(`Error HTTP: ${response.status}`)
@@ -639,14 +637,16 @@ function App() {
     setIsTasksLoading(true)
     const loadTasks = async () => {
       try {
-        const baseUrl = (import.meta.env.VITE_TIME_ENTRY_API_BASE_URL || 'https://timeentryforaptusfinancials-730085095.development.catalystserverless.com/server/time_entry_services').replace(/\/$/, '')
-        const response = await fetch(`${baseUrl}/${encodeURIComponent(organizationId)}/tareas`, { signal: controller.signal })
+        const response = await fetch(`${TIME_ENTRY_API}/${encodeURIComponent(organizationId)}/tareas-estandar`, { signal: controller.signal })
         if (!response.ok) throw new Error('No se pudo cargar el catálogo de tareas.')
         const data = await response.json()
-        if (!Array.isArray(data) || !data.every(t => typeof t.id === 'string' && t.id && typeof t.cf_nombre === 'string' && typeof t.cf_nombre_ingl_s === 'string')) {
+        if (!Array.isArray(data) || !data.every(t => Number.isInteger(t.id) && typeof t.nombre === 'string')) {
           throw new Error('El catálogo de tareas tiene un formato inesperado.')
         }
-        if (!controller.signal.aborted) setTasks(data)
+        const active = data.filter(t => t.activo === undefined || Number(t.activo) === 1)
+          .sort((a, b) => (a.orden ?? 0) - (b.orden ?? 0))
+          .map(t => ({ id: String(t.id), nombre: t.nombre, codigo_utbms: t.codigo_utbms ?? null, facturable: Number(t.facturable ?? 1) }))
+        if (!controller.signal.aborted) setTasks(active)
       } catch (error) {
         if (!controller.signal.aborted) setTasksError(error instanceof Error ? error.message : 'No se pudieron cargar las tareas.')
       } finally {
@@ -662,7 +662,7 @@ function App() {
     const controller = new AbortController()
     const load = async () => {
       try {
-        const detail = await getTimeEntry(organizationId, editId, controller.signal)
+        const detail = await getTiempo(organizationId, editId, controller.signal)
         if (!controller.signal.aborted) setEditDetail(detail)
       } catch (error) {
         if (!controller.signal.aborted) setEditError(error instanceof Error ? error.message : 'No se pudo cargar el tiempo.')
@@ -680,31 +680,31 @@ function App() {
         const response = await fetch(TIME_ENTRY_API + '/' + organizationId + '/proyectos', { signal: controller.signal })
         if (!response.ok) throw new Error('No se pudo relacionar el proyecto del tiempo con el catálogo.')
         const projects = await response.json()
-        const project = projects.find((p: { zoho_id: string }) => String(p.zoho_id) === editDetail.project_id)
-        const lawyer = abogados.find(a => a.zoho_user_id === editDetail.user_id)
+        const project = projects.find((p: { id: number }) => p.id === editDetail.proyecto_id)
+        const lawyer = abogados.find(a => a.ID === String(editDetail.abogado_id))
         if (!project || !clientes.some(c => c.ID === String(project.cliente_id))) throw new Error('El proyecto o cliente de este tiempo no está disponible en Aptus Sync.')
         if (!lawyer) throw new Error('El abogado de este tiempo no está disponible en el catálogo activo de Aptus Sync.')
         if (controller.signal.aborted) return
         editHydrated.current = true
-        editProject.current = editDetail.project_id
+        editProject.current = String(editDetail.proyecto_id)
         setSelectedCliente(String(project.cliente_id))
         // A selected client may already have been loaded before the details arrived.
         if (selectedCliente === String(project.cliente_id)) void loadProyectos(organizationId!, String(project.cliente_id))
         setSelectedAbogados([lawyer.ID]); setMultipleAbogados(false)
-        const task = tasks.find(t => t.cf_nombre.trim().toLocaleLowerCase('es') === editDetail.task_name.trim().toLocaleLowerCase('es'))
-        const taskId = task?.id || 'existing-' + editDetail.task_id
-        if (!task) setTasks(current => [...current, { id: taskId, cf_nombre: editDetail.task_name, cf_nombre_ingl_s: '' }])
-        setSelectedTask(taskId)
-        const [year, month, day] = editDetail.log_date.split('-').map(Number)
+        // Tiempos anteriores pueden traer solo el texto de la tarea: se busca por nombre en el catálogo.
+        const byName = (name: string | null) => tasks.find(t => t.nombre.trim().toLocaleLowerCase('es') === (name || '').trim().toLocaleLowerCase('es'))
+        const task = editDetail.tarea_estandar_id != null ? tasks.find(t => t.id === String(editDetail.tarea_estandar_id)) : byName(editDetail.tarea)
+        setSelectedTask(task?.id || '')
+        const [year, month, day] = editDetail.fecha.split('-').map(Number)
         setDate(new Date(year, month - 1, day))
-        const [hours, minutes] = editDetail.log_time.split(':').map(Number)
-        const decimal = (hours + minutes / 60).toFixed(2)
-        setBillableTime(editDetail.is_billable ? decimal : '0.00')
-        setNonBillableTime(editDetail.is_billable ? '0.00' : decimal)
-        setDescription(editDetail.notes || '')
-        setReference(Array.isArray(editDetail.timesheet_custom_fields) ? String(editDetail.timesheet_custom_fields.find(f => f.api_name === 'cf_referencia')?.value ?? '') : '')
+        const decimal = editDetail.horas.toFixed(2)
+        setBillableTime(editDetail.facturable === 1 ? decimal : '0.00')
+        setNonBillableTime(editDetail.facturable === 1 ? '0.00' : decimal)
+        setDescription(editDetail.descripcion || '')
         setRegistrarComo('horas')
-        if (String(editDetail.timer_started_at || '').trim() || String(editDetail.timer_started_at_utc_time || '').trim()) setEditError('Este tiempo tiene un cronómetro activo. Deténlo en Books y recarga para editarlo.')
+        const locked = lockReason(editDetail)
+        if (locked) setEditError(locked)
+        else if (!task) toast.warning(`La tarea "${editDetail.tarea || ''}" no está en el catálogo de tareas estándar. Selecciona una tarea antes de guardar.`)
       } catch (error) {
         if (!controller.signal.aborted) setEditError(error instanceof Error ? error.message : 'No se pudo cargar el formulario.')
       }
@@ -736,7 +736,6 @@ function App() {
       const lawyer = template.cf_abogado ? abogados.find(a => a.zoho_user_id === template.cf_abogado) : null
       if ((template.cf_cliente && !client) || (template.cf_proyecto && (!project || !client || String(project.cliente_id) !== client.ID))) throw new Error('El cliente o proyecto de la plantilla no está disponible o su relación no coincide con Aptus.')
       if (template.cf_abogado && !lawyer) throw new Error('El abogado de la plantilla no está disponible.')
-      if (template.cf_tarea && !tasks.some(t => t.id === template.cf_tarea)) throw new Error('La tarea de la plantilla no está disponible en el catálogo.')
       if (!['Horas', 'Inicia y Termina'].includes(template.cf_registrar_como)) throw new Error('Modo de plantilla no reconocido.')
       const billable = template.cf_horas_facturables || '0'
       const nonBillable = template.cf_no_facturables || '0'
@@ -747,11 +746,13 @@ function App() {
       if (project) templateProject.current = template.cf_proyecto
       setSelectedTemplate(id); setSelectedCliente(client?.ID || ''); setSelectedProyecto('')
       setSelectedAbogados(lawyer ? [lawyer.ID] : []); setMultipleAbogados(false)
-      setSelectedTask(template.cf_tarea || '')
+      // Plantillas anteriores guardan la tarea del catálogo de Books: si no está entre las estándar, se elige a mano.
+      const templateTask = tasks.some(t => t.id === template.cf_tarea) ? template.cf_tarea : ''
+      if (template.cf_tarea && !templateTask) toast.warning('La tarea de la plantilla no está en el catálogo de tareas estándar. Selecciónala antes de guardar.')
+      setSelectedTask(templateTask)
       setRegistrarComo(template.cf_registrar_como === 'Inicia y Termina' ? 'inicia' : 'horas')
       setStartTime(''); setEndTime('')
       setBillableTime(Number(billable).toFixed(2)); setNonBillableTime(Number(nonBillable).toFixed(2))
-      setReference(template.cf_reference_number || '')
       if (client?.ID === selectedCliente && project) await loadProyectos(organizationId, client.ID)
       if (!project) setApplyingTemplate(false)
     } catch (error) {
@@ -780,15 +781,16 @@ function App() {
       if (!organizationId || !/^\d+$/.test(organizationId)) throw new Error('Falta una organización válida.')
       if (!pendingSave.current) {
         if (!selectedCliente) throw new Error('Selecciona un cliente.')
-        const entries = buildTimeEntries({
-          projectId: selectedProyectoData?.zoho_id,
-          userIds: selectedAbogados.map(id => abogados.find(a => a.ID === id)?.zoho_user_id),
-          taskName: tasks.find(t => t.id === selectedTask)?.cf_nombre,
-          date: format(date, 'yyyy-MM-dd'), notes: description, reference,
+        const entries = buildTiempos({
+          projectId: selectedProyecto, lawyerIds: selectedAbogados, taskId: selectedTask,
+          date: format(date, 'yyyy-MM-dd'), notes: description,
           mode: registrarComo, billable: billableTime, nonBillable: nonBillableTime,
           start: startTime, end: endTime,
         })
-        if (editId !== null && (entries.length !== 1 || registrarComo === 'cronometro')) throw new Error('Al editar se conserva un solo registro: un abogado y tiempo facturable o no facturable, sin iniciar un cronómetro nuevo.')
+        if (editId !== null) {
+          if (entries.length !== 1) throw new Error('Al editar se conserva un solo registro: un abogado y tiempo facturable o no facturable.')
+          if (editDetail && (entries[0].abogado_id !== editDetail.abogado_id || entries[0].proyecto_id !== editDetail.proyecto_id)) throw new Error('Al editar no se puede cambiar el abogado ni el proyecto. Elimina el tiempo y captúralo de nuevo.')
+        }
         const fingerprint = JSON.stringify([organizationId, entries])
         if (savedFingerprint.current === fingerprint) throw new Error('Estos datos ya se guardaron. Modifica los campos para crear un registro nuevo.')
         let template: TemplateValues | undefined
@@ -797,22 +799,24 @@ function App() {
           if (templatesLoading || templatesError) throw new Error('Actualiza el catálogo de plantillas antes de guardar una nueva.')
           if (templates.some(t => t.cf_clave.trim().toLocaleLowerCase() === templateKey.trim().toLocaleLowerCase())) throw new Error('Ya existe una plantilla con esa clave. Usa otra para crear una nueva.')
           if (selectedAbogados.length !== 1) throw new Error('El módulo de plantillas admite un solo abogado por plantilla.')
-          if (registrarComo === 'cronometro') throw new Error('El módulo de plantillas solo admite Horas e Inicia y Termina.')
           const customer = clientes.find(c => c.ID === selectedCliente)
           if (!customer?.zoho_id) throw new Error('Actualiza el catálogo de clientes para obtener su ID de Books.')
           if (!/^\d+$/.test(selectedTask)) throw new Error('Selecciona una tarea del catálogo global para guardar la plantilla.')
-          if (reference.length > 255) throw new Error('La referencia de plantilla admite hasta 255 caracteres.')
-          template = { cf_clave: templateKey.trim(), cf_cliente: customer.zoho_id, cf_proyecto: selectedProyectoData!.zoho_id!, cf_abogado: entries[0].user_id, cf_tarea: selectedTask, cf_registrar_como: registrarComo === 'inicia' ? 'Inicia y Termina' : 'Horas', cf_horas_facturables: currentBillable.toFixed(2), cf_no_facturables: nonBillableTime, cf_reference_number: reference }
+          const project = selectedProyectoData
+          const lawyerBooksId = abogados.find(a => a.ID === selectedAbogados[0])?.zoho_user_id
+          if (!project?.zoho_id || !lawyerBooksId) throw new Error('Las plantillas guardan los IDs de Books: el proyecto y el abogado deben estar enlazados a Books.')
+          template = { cf_clave: templateKey.trim(), cf_cliente: customer.zoho_id, cf_proyecto: project.zoho_id, cf_abogado: lawyerBooksId, cf_tarea: selectedTask, cf_registrar_como: registrarComo === 'inicia' ? 'Inicia y Termina' : 'Horas', cf_horas_facturables: currentBillable.toFixed(2), cf_no_facturables: nonBillableTime, cf_reference_number: '' }
         }
-        pendingSave.current = { organizationId, fingerprint, entries, ids: [], template }
+        pendingSave.current = { organizationId, fingerprint, entries, saved: [], template }
       }
       savingRef.current = true
       setIsSaving(true)
       setHasPendingSave(true)
       const batch = pendingSave.current
       while (batch.entries.length) {
-        const id = await postTimeEntry(batch.organizationId, batch.entries[0], editId ?? undefined)
-        batch.ids.push(id)
+        const entry = batch.entries[0]
+        const body = editId !== null ? { fecha: entry.fecha, horas: entry.horas, descripcion: entry.descripcion, tarea_estandar_id: entry.tarea_estandar_id, facturable: entry.facturable } : entry
+        batch.saved.push(await saveTiempo(batch.organizationId, body, editId ?? undefined))
         batch.entries.shift()
       }
       let templateSaved = false
@@ -824,18 +828,18 @@ function App() {
       savedFingerprint.current = batch.fingerprint
       pendingSave.current = null
       setHasPendingSave(false)
-      setStatusModal({ isOpen: true, type: 'success', title: editId !== null ? 'Tiempo actualizado' : registrarComo === 'cronometro' ? 'Cronómetro iniciado en Books' : 'Tiempo guardado', message: `Se guardaron ${batch.ids.length} registro(s). ID de Books: ${batch.ids.join(', ')}.${templateSaved ? ' La nueva plantilla también se guardó.' : ''}` })
+      setStatusModal({ isOpen: true, type: 'success', title: editId !== null ? 'Tiempo actualizado' : 'Tiempo guardado', message: `Se guardaron ${batch.saved.length} registro(s) en Aptus: #${batch.saved.map(t => t.id).join(', #')}.${backupWarning(batch.saved)}${templateSaved ? ' La nueva plantilla también se guardó.' : ''}` })
     } catch (error) {
       const uncertain = error instanceof Error && 'uncertain' in error && error.uncertain === true
       if (uncertain) setSaveBlocked(true)
       const batch = pendingSave.current
-      if (batch && !batch.ids.length && !uncertain) {
+      if (batch && !batch.saved.length && !uncertain) {
         pendingSave.current = null
         setHasPendingSave(false)
       }
       setStatusModal({
         isOpen: true, type: 'error', title: batch?.template && !batch.entries.length ? 'Tiempo guardado; plantilla pendiente' : uncertain ? 'Guardado por verificar' : 'No se completó el guardado',
-        message: `${error instanceof Error ? error.message : 'Error al guardar.'}${batch?.ids.length ? ` Ya guardados: ${batch.ids.join(', ')}.` : ''}${batch?.ids.length && !uncertain ? ' Puedes reintentar los pendientes sin reenviar los ya guardados.' : ''}`
+        message: `${error instanceof Error ? error.message : 'Error al guardar.'}${batch?.saved.length ? ` Ya guardados: #${batch.saved.map(t => t.id).join(', #')}.` : ''}${batch?.saved.length && !uncertain ? ' Puedes reintentar los pendientes sin reenviar los ya guardados.' : ''}`
       })
     } finally {
       savingRef.current = false
@@ -845,11 +849,11 @@ function App() {
 
   function handleCancel() {
     const params = new URLSearchParams(window.location.search)
-    const org = organizationId || params.get('organization_id') || '636939444'
+    const org = organizationId || params.get('organization_id') || ''
     const origin = params.get('origin')
 
     try {
-      const targetUrl = new URL(origin || 'https://universal-timeentry-calendar.onslate.com/')
+      const targetUrl = new URL(origin || CALENDAR_URL)
       if (!targetUrl.searchParams.get('organization_id')) {
         targetUrl.searchParams.set('organization_id', org)
       }
@@ -857,7 +861,7 @@ function App() {
       targetUrl.searchParams.set('_t', Date.now().toString())
       window.location.href = targetUrl.toString()
     } catch {
-      window.location.href = `https://universal-timeentry-calendar.onslate.com/?organization_id=${encodeURIComponent(org)}&_t=${Date.now()}`;
+      window.location.href = `${CALENDAR_URL}?organization_id=${encodeURIComponent(org)}&_t=${Date.now()}`;
     }
   }
 
@@ -1299,7 +1303,7 @@ function App() {
                       <SelectContent className="rounded-lg shadow-md border-slate-100 max-h-60">
                         {tasks.map(t => (
                           <SelectItem key={t.id} value={t.id}>
-                            {t.cf_nombre}
+                            {t.nombre}{t.codigo_utbms ? ` (${t.codigo_utbms})` : ''}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -1309,6 +1313,9 @@ function App() {
                         <p>{tasksError}</p>
                         <button type="button" onClick={() => setTasksReload(value => value + 1)} className="mt-1 underline font-medium">Reintentar</button>
                       </div>
+                    )}
+                    {selectedProyectoData && selectedProyectoData.tipo_cobro !== 'horas' && (
+                      <p className="text-xs text-amber-700">Proyecto de {selectedProyectoData.tipo_cobro === 'iguala' ? 'iguala' : 'cuota fija'}: lo que se cobra es el honorario fijo, así que sus horas normalmente se capturan como no facturables.</p>
                     )}
 
                   </div>
@@ -1327,11 +1334,9 @@ function App() {
                 {([
                   { key: 'horas', label: 'Horas', Icon: Clock },
                   { key: 'inicia', label: 'Inicia / Termina', Icon: Play },
-                  { key: 'cronometro', label: 'Cronómetro', Icon: Timer },
                 ] as const).map(({ key, label, Icon }) => (
                   <button
                     key={key}
-                    disabled={editId !== null && key === 'cronometro'}
                     onClick={() => setRegistrarComo(key)}
                     className={cn(
                       'min-w-0 flex-1 flex flex-col items-center justify-center gap-1.5 px-1 py-2 text-[11px] sm:text-xs font-semibold rounded-md transition-all',
@@ -1481,18 +1486,6 @@ function App() {
             </div>
           )}
 
-          {registrarComo === 'cronometro' && (
-            <div className="animate__animated animate__zoomIn animate__faster rounded-xl overflow-hidden shadow-sm bg-gradient-to-r from-theme-from to-theme-to p-4 flex flex-col items-center justify-center text-center">
-              <div className="w-13 h-13 rounded-full bg-white/15 flex items-center justify-center border border-white/25 mb-3 shadow-inner">
-                <Lottie src={clockAnimation} loop autoplay className="w-10 h-10" />
-              </div>
-              <h3 className="text-white font-bold text-xl mb-2">Cronómetro Listo</h3>
-              <p className="text-white/80 font-medium text-sm max-w-md">
-                El cronómetro iniciará automáticamente en cuanto se guarde este registro.
-              </p>
-            </div>
-          )}
-
           {/* ── ROW 4: Descripción & Referencia ──────────────────────────────── */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
 
@@ -1564,24 +1557,22 @@ function App() {
                   <div className="w-2 h-2 border-r-2 border-b-2 border-slate-300"></div>
                 </div>
               </div>
-              <p className="text-xs text-slate-500 mt-2 font-medium">{description.length} / 500 caracteres</p>
+              <p className="text-xs text-slate-500 mt-2 font-medium">{description.length} / {DESCRIPCION_MAX} caracteres</p>
             </div>
 
             {/* Referencia + Checkboxes */}
             <div className={cn(cardCls, "min-w-0 flex flex-col self-start")}>
 
-              {/* Referencia */}
+              {/* Dónde se guarda */}
               <div>
                 <div className="flex items-center gap-2 mb-3">
                   <Briefcase className={sectionIconCls} />
-                  <span className={cn(sectionTitleCls, 'text-theme-text')}>Referencia</span>
+                  <span className={cn(sectionTitleCls, 'text-theme-text')}>Antes de guardar</span>
                 </div>
-                <Input
-                  className="bg-white border-slate-200 hover:border-slate-300 focus:border-theme-from focus:ring-1 focus:ring-theme-from/30 transition-all h-9 rounded-lg shadow-sm text-slate-700 text-sm"
-                  value={reference}
-                  onChange={e => setReference(e.target.value)}
-                  placeholder="Referencia o quién solicita el trabajo"
-                />
+                <ul className="space-y-1.5 text-xs text-slate-600">
+                  <li className="flex gap-2"><span className="text-theme-text font-bold">•</span>Se guarda en Aptus con la tarifa del abogado y Aptus lo respalda en Books.</li>
+                  <li className="flex gap-2"><span className="text-theme-text font-bold">•</span>Queda como <b>capturado</b> y entra a una Prebill después de liberarse.</li>
+                </ul>
               </div>
 
               {/* Opciones */}
@@ -1601,7 +1592,7 @@ function App() {
                 {saveTemplate && <div className="space-y-2">
                   <Label htmlFor="template-key" className="text-xs text-theme-text">Clave de la nueva plantilla *</Label>
                   <Input id="template-key" value={templateKey} onChange={e => setTemplateKey(e.target.value)} maxLength={255} placeholder="Ej. Revisión de contratos" />
-                  <p className="text-xs text-slate-500">Guarda cliente, proyecto, un abogado, tarea, modo, horas y referencia. No guarda fecha, descripción ni horas de inicio/fin.</p>
+                  <p className="text-xs text-slate-500">Guarda cliente, proyecto, un abogado, tarea, modo y horas. No guarda fecha, descripción ni horas de inicio/fin.</p>
                 </div>}
               </div>
 

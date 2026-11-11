@@ -2,75 +2,77 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import ts from 'typescript'
-const source = fs.readFileSync(new URL('../src/lib/time-entry.ts', import.meta.url), 'utf8').replace('import.meta.env.VITE_TIME_ENTRY_API_BASE_URL', 'undefined').replace('import.meta.env.DEV', 'true')
+
+const source = fs.readFileSync(new URL('../src/lib/time-entry.ts', import.meta.url), 'utf8')
+  .replace('import.meta.env.VITE_TIME_ENTRY_API_BASE_URL', 'undefined').replace('import.meta.env.VITE_CALENDAR_URL', 'undefined').replace('import.meta.env.DEV', 'true')
 const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext } }).outputText
-const { buildTimeEntries, decimalToDuration, postTimeEntry, getTimeEntry } = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'))
-const input = { projectId: '123', userIds: ['456'], taskName: 'Estándar', date: '2026-10-11', notes: 'Actividad', reference: 'Referencia', mode: 'horas', billable: '1.55', nonBillable: '0.00', start: '09:00', end: '17:00' }
-test('decimal hours convert to minutes, not decimal digits', () => {
-  assert.equal(decimalToDuration('1.55'), '01:33')
-  assert.equal(decimalToDuration('0.25'), '00:15')
-  assert.equal(decimalToDuration('1.50'), '01:30')
+const { buildTiempos, parseHours, rangeToHours, saveTiempo, getTiempo, lockReason, backupWarning } = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'))
+
+const input = { projectId: '8', lawyerIds: ['6'], taskId: '1', date: '2026-11-11', notes: '  Revisión del contrato  ', mode: 'horas', billable: '1.25', nonBillable: '0.00', start: '09:00', end: '17:30' }
+
+test('horas decimales: 1.25 = 1 h 15 min; máximo 2 decimales y 24 h', () => {
+  assert.equal(parseHours('1.25'), 1.25)
+  assert.equal(parseHours('0.00'), 0)
+  for (const bad of ['1.234', '-1', 'abc', '25']) assert.throws(() => parseHours(bad))
+  assert.equal(rangeToHours('09:00', '17:30'), 8.5)
+  assert.equal(rangeToHours('09:00', '09:20'), 0.33)
 })
-test('creates entries per lawyer and billing classification', () => {
-  const entries = buildTimeEntries({ ...input, userIds: ['456', '789', '456'], nonBillable: '0.50' })
+
+test('un registro por abogado y clasificación, con IDs locales de Aptus', () => {
+  const entries = buildTiempos({ ...input, lawyerIds: ['6', '7', '6'], nonBillable: '0.50' })
   assert.equal(entries.length, 4)
-  assert.deepEqual(entries.map(e => e.user_id), ['456', '456', '789', '789'])
-  assert.deepEqual(entries.map(e => e.is_billable), [true, false, true, false])
-  assert.equal(entries[0].project_id, '123'); assert.equal(entries[0].cf_referencia, 'Referencia')
-  assert.equal(entries[1].log_time, '00:30')
-  assert.ok(!('cliente' in entries[0])); assert.ok(!('plantilla' in entries[0]))
-})
-test('validation rejects missing IDs, empty time, excessive notes and overnight range', () => {
-  for (const patch of [{ projectId: null }, { userIds: [undefined] }, { userIds: [] }, { taskName: '' }, { billable: '0.00' }, { notes: 'x'.repeat(501) }, { mode: 'inicia', start: '17:00', end: '09:00' }]) assert.throws(() => buildTimeEntries({ ...input, ...patch }))
-})
-test('range and timer send mutually exclusive time representations', () => {
-  const [range] = buildTimeEntries({ ...input, mode: 'inicia' })
-  assert.equal(range.begin_time, undefined); assert.equal(range.end_time, undefined); assert.equal(range.log_time, '08:00')
-  const [timer] = buildTimeEntries({ ...input, mode: 'cronometro' })
-  assert.equal(timer.start_timer, true); assert.equal(timer.log_time, undefined)
-  assert.throws(() => buildTimeEntries({ ...input, mode: 'cronometro', userIds: ['456', '789'] }))
-})
-test('POST contract and response handling without real writes', async () => {
-  const original = globalThis.fetch
-  try {
-    globalThis.fetch = async (url, options) => {
-      assert.equal(url, '/api/time-entry/123/tiempos'); assert.equal(options.method, 'POST')
-      assert.equal(JSON.parse(options.body).user_id, '456')
-      return new Response(JSON.stringify({ time_entry: { time_entry_id: '987' } }), { status: 201 })
-    }
-    assert.equal(await postTimeEntry('123', buildTimeEntries(input)[0]), '987')
-    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Datos inválidos', stage: 'validation', outcome_unknown: false }), { status: 400 })
-    await assert.rejects(postTimeEntry('123', buildTimeEntries(input)[0]), e => e.uncertain === false)
-    globalThis.fetch = async () => { throw new Error('Network') }
-    await assert.rejects(postTimeEntry('123', buildTimeEntries(input)[0]), e => e.uncertain === true)
-    globalThis.fetch = async () => new Response('<html>Gateway error</html>', { status: 502 })
-    await assert.rejects(postTimeEntry('123', buildTimeEntries(input)[0]), e => e.uncertain === true)
-  } finally { globalThis.fetch = original }
+  assert.deepEqual(entries.map(e => e.abogado_id), [6, 6, 7, 7])
+  assert.deepEqual(entries.map(e => e.facturable), [true, false, true, false])
+  assert.deepEqual(entries[0], { abogado_id: 6, proyecto_id: 8, fecha: '2026-11-11', descripcion: 'Revisión del contrato', tarea_estandar_id: 1, horas: 1.25, facturable: true })
+  assert.equal(entries[1].horas, 0.5)
+  assert.ok(!('cf_referencia' in entries[0])); assert.ok(!('log_time' in entries[0]))
 })
 
-test('range preserves exact minutes and requires both times', () => {
-  assert.equal(buildTimeEntries({ ...input, mode: 'inicia', start: '09:17', end: '10:20' })[0].log_time, '01:03')
-  for (const [start,end] of [['',''],['09:00',''],['','10:00'],['09:00','09:00']]) assert.throws(() => buildTimeEntries({...input,mode:'inicia',start,end}))
-})
-test('timer success requires Books to confirm a started timer', async () => {
-  const original=globalThis.fetch
-  try {
-    const payload=buildTimeEntries({...input,mode:'cronometro'})[0]
-    globalThis.fetch=async()=>new Response(JSON.stringify({time_entry:{time_entry_id:'987',timer_started_at:'2026-10-11T12:00:00'}}),{status:201})
-    assert.equal(await postTimeEntry('123',payload),'987')
-    globalThis.fetch=async()=>new Response(JSON.stringify({time_entry:{time_entry_id:'987',timer_started_at:''}}),{status:201})
-    await assert.rejects(postTimeEntry('123',payload),e=>e.uncertain && e.message.includes('987'))
-  } finally {globalThis.fetch=original}
+test('inicia / termina se convierte a horas facturables', () => {
+  const [range] = buildTiempos({ ...input, mode: 'inicia' })
+  assert.equal(range.horas, 8.5); assert.equal(range.facturable, true)
 })
 
-test('edit loads by ID and sends PUT to the same ID', async () => {
- const original=globalThis.fetch;
- try {
-  const entry={time_entry_id:'987',is_billable:false,log_date:'2026-10-11',log_time:'00:01'};
-  globalThis.fetch=async(url,options)=>{assert.ok(url.endsWith('/123/tiempos/987'));return new Response(JSON.stringify({time_entry:entry}))};
-  assert.equal((await getTimeEntry('123','987',new AbortController().signal)).is_billable,false);
-  await assert.rejects(getTimeEntry('123','',new AbortController().signal));
-  globalThis.fetch=async(url,options)=>{assert.ok(url.endsWith('/987'));assert.equal(options.method,'PUT');return new Response(JSON.stringify({time_entry:entry}))};
-  assert.equal(await postTimeEntry('123',buildTimeEntries(input)[0],'987'),'987');
- } finally {globalThis.fetch=original}
-});
+test('validaciones: proyecto, abogado, tarea, fecha, tiempo, descripción, rango y cronómetro', () => {
+  for (const patch of [{ projectId: '' }, { lawyerIds: [] }, { lawyerIds: [undefined] }, { taskId: '' }, { date: '2026-02-30' }, { billable: '0.00' },
+    { notes: 'x'.repeat(501) }, { mode: 'inicia', start: '17:00', end: '09:00' }, { mode: 'cronometro' }]) {
+    assert.throws(() => buildTiempos({ ...input, ...patch }), undefined, JSON.stringify(patch))
+  }
+})
+
+test('crear usa POST /tiempos y editar PATCH /tiempos/:id', async () => {
+  const calls = []
+  globalThis.fetch = async (url, options) => { calls.push({ url, options }); return { ok: true, status: 201, json: async () => ({ id: 73, books_estado: 'respaldado' }) } }
+  const [entry] = buildTiempos(input)
+  await saveTiempo('636939444', entry)
+  await saveTiempo('636939444', { fecha: entry.fecha, horas: 2, descripcion: '', tarea_estandar_id: 1, facturable: true }, '73')
+  assert.equal(calls[0].url, '/api/time-entry/636939444/tiempos'); assert.equal(calls[0].options.method, 'POST')
+  assert.equal(JSON.parse(calls[0].options.body).abogado_id, 6)
+  assert.equal(calls[1].url, '/api/time-entry/636939444/tiempos/73'); assert.equal(calls[1].options.method, 'PATCH')
+})
+
+test('red caída o respuesta sin id bloquean el reenvío; 409/422 de la API no', async () => {
+  const [entry] = buildTiempos(input)
+  globalThis.fetch = async () => { throw new Error('offline') }
+  await assert.rejects(saveTiempo('1', entry), e => e.uncertain === true)
+  globalThis.fetch = async () => ({ ok: true, status: 201, json: async () => ({}) })
+  await assert.rejects(saveTiempo('1', entry), e => e.uncertain === true)
+  globalThis.fetch = async () => ({ ok: false, status: 422, json: async () => ({ error: 'Pedro no tiene tarifa asignada en USD', stage: 'create_tiempo', outcome_unknown: false }) })
+  await assert.rejects(saveTiempo('1', entry), e => e.uncertain === false && e.message === 'Pedro no tiene tarifa asignada en USD')
+  globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => { throw new Error('html') } })
+  await assert.rejects(saveTiempo('1', entry), e => e.uncertain === false && /HTTP 404/.test(e.message))
+})
+
+test('getTiempo valida id y forma; candado igual al de la API', async () => {
+  await assert.rejects(getTiempo('1', 'abc', new AbortController().signal))
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ id: 73, horas: '2', fecha: '2026-11-11', proyecto_id: 8, abogado_id: 6 }) })
+  await assert.rejects(getTiempo('1', '73', new AbortController().signal), /formato inesperado/)
+  assert.equal(lockReason({ facturado: 0, prebill_id: null, status: 'capturado' }), null)
+  assert.match(lockReason({ facturado: 0, prebill_id: 9, status: 'en_prebill' }), /Prebill #9/)
+  assert.match(lockReason({ facturado: 1, prebill_id: 9, status: 'facturado' }), /facturado/)
+})
+
+test('aviso de respaldo pendiente en Books', () => {
+  assert.equal(backupWarning([{ books_estado: 'respaldado' }]), '')
+  assert.match(backupWarning([{ books_estado: 'pendiente', books_error: 'Books no respondió.' }, { books_estado: 'respaldado' }]), /1 registro\(s\).*Books no respondió/)
+})

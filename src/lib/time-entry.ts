@@ -1,87 +1,121 @@
-// Development uses Vite's same-origin proxy; production keeps the configured API.
-export const TIME_ENTRY_API = import.meta.env.DEV ? '/api/time-entry' : (import.meta.env.VITE_TIME_ENTRY_API_BASE_URL || 'https://timeentryforaptusfinancials-730085095.development.catalystserverless.com/server/time_entry_services').replace(/\/$/, '')
+// Función del proyecto Tiempos (TimeEntryForAptusFinancials): time_entry_services.
+// Desarrollo usa el proxy de Vite (mismo origen); VITE_TIME_ENTRY_API_BASE_URL la reemplaza si se define.
+const FALLBACK_API = 'https://timeentryforaptusfinancials-730085095.development.catalystserverless.com/server/time_entry_services'
+export const TIME_ENTRY_API = import.meta.env.DEV ? '/api/time-entry' : (import.meta.env.VITE_TIME_ENTRY_API_BASE_URL || FALLBACK_API).replace(/\/$/, '')
 
-export interface TimePayload {
-  project_id: string; user_id: string; task_name: string; log_date: string
-  is_billable: boolean; notes: string; cf_referencia: string
-  log_time?: string; begin_time?: string; end_time?: string; start_timer?: boolean
+// A dónde regresa "Cancelar" si no llega ?origin= (calendario de tiempos).
+export const CALENDAR_URL = import.meta.env.VITE_CALENDAR_URL || 'https://universal-timeentry-calendar.onslate.com/'
+
+export const DESCRIPCION_MAX = 500
+
+// Lo que se manda a ReportesSandbox (POST /tiempos). IDs locales de Aptus, horas decimales.
+// La API guarda el tiempo con su tarifa y lo respalda en Books por su cuenta.
+export interface TiempoPayload {
+  abogado_id: number; proyecto_id: number; fecha: string; horas: number
+  descripcion: string; tarea_estandar_id: number; facturable: boolean
+}
+export type TiempoUpdate = Omit<TiempoPayload, 'abogado_id' | 'proyecto_id'>
+
+// Lo que devuelve ReportesSandbox para un tiempo (campos que usa la interfaz).
+export interface Tiempo {
+  id: number; abogado_id: number; proyecto_id: number; fecha: string; horas: number
+  descripcion: string | null; tarea_estandar_id: number | null; tarea: string | null
+  facturable: number; liberado: number; prebill_id: number | null; facturado: number; status: string
+  books_estado?: string | null; books_error?: string | null; tarifa_aplicada?: number | null; moneda?: string | null
 }
 
-export function decimalToDuration(value: string): string {
-  if (!/^\d+(\.\d{1,2})?$/.test(value)) throw new Error('El tiempo debe ser un número de horas válido.')
-  const minutes = Math.round(Number(value) * 60)
-  if (minutes > 5999) throw new Error('El tiempo excede el máximo permitido por registro.')
-  return `${Math.floor(minutes / 60).toString().padStart(2, '0')}:${(minutes % 60).toString().padStart(2, '0')}`
+const intId = (value: string | null | undefined) => value && /^\d+$/.test(value) ? Number(value) : null
+
+// Horas decimales: "1.25" = 1 h 15 min. Máximo 2 decimales y 24 h por registro.
+export function parseHours(value: string): number {
+  if (!/^\d+(\.\d{1,2})?$/.test(value.trim())) throw new Error('El tiempo debe ser un número de horas válido.')
+  const hours = Number(value)
+  if (hours > 24) throw new Error('Un registro no puede pasar de 24 horas.')
+  return hours
 }
 
-export function buildTimeEntries(input: {
-  projectId?: string | null; userIds: Array<string | null | undefined>; taskName?: string
-  date: string; notes: string; reference: string; mode: string
-  billable: string; nonBillable: string; start: string; end: string
-}): TimePayload[] {
-  if (!input.projectId || !/^\d+$/.test(input.projectId)) throw new Error('Selecciona un proyecto con ID de Books válido. Si falta, actualiza el catálogo de proyectos.')
-  if (!input.userIds.length || input.userIds.some(id => !id || !/^\d+$/.test(id))) throw new Error('Selecciona abogados con usuario de Books asociado. Actualiza el catálogo si falta esa información.')
-  if (!input.taskName?.trim()) throw new Error('Selecciona una tarea.')
+// Inicia / Termina dentro del mismo día → horas decimales redondeadas a 2 decimales.
+export function rangeToHours(start: string, end: string): number {
+  const valid = (value: string) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)
+  if (!valid(start) || !valid(end) || end <= start) throw new Error('La hora final debe ser posterior a la inicial, dentro del mismo día.')
+  const minutes = (value: string) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3))
+  return Math.round((minutes(end) - minutes(start)) / 60 * 100) / 100
+}
+
+// Un registro por abogado y por clasificación (facturable / no facturable).
+export function buildTiempos(input: {
+  projectId?: string | null; lawyerIds: Array<string | null | undefined>; taskId?: string | null
+  date: string; notes: string; mode: string; billable: string; nonBillable: string; start: string; end: string
+}): TiempoPayload[] {
+  const proyecto_id = intId(input.projectId)
+  if (!proyecto_id) throw new Error('Selecciona un proyecto.')
+  const lawyers = input.lawyerIds.map(id => intId(id))
+  if (!lawyers.length || lawyers.some(id => !id)) throw new Error('Selecciona al menos un abogado.')
+  const tarea_estandar_id = intId(input.taskId)
+  if (!tarea_estandar_id) throw new Error('Selecciona una tarea.')
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.date) || !Number.isFinite(Date.parse(input.date)) || new Date(input.date).toISOString().slice(0, 10) !== input.date) throw new Error('Selecciona una fecha válida.')
-  if (input.notes.length > 500) throw new Error('La descripción admite hasta 500 caracteres para guardar en Books. Reduce el texto; no se recortará automáticamente.')
-  const parts: Array<Partial<TimePayload>> = []
-  if (input.mode === 'cronometro') {
-    if (new Set(input.userIds).size > 1) throw new Error('Inicia el cronómetro para un solo abogado a la vez.')
-    parts.push({ is_billable: true, start_timer: true })
-  } else {
-    if (input.mode === 'inicia') {
-      const valid = (value: string) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)
-      if (!valid(input.start) || !valid(input.end) || input.end <= input.start) throw new Error('La hora final debe ser posterior a la inicial, dentro del mismo día.')
-      const minutes = (value: string) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3))
-      const duration = minutes(input.end) - minutes(input.start)
-      parts.push({ is_billable: true, log_time: `${Math.floor(duration / 60).toString().padStart(2, '0')}:${(duration % 60).toString().padStart(2, '0')}` })
-    } else if (input.mode === 'horas') {
-      const log_time = decimalToDuration(input.billable)
-      if (log_time !== '00:00') parts.push({ is_billable: true, log_time })
-    } else throw new Error('Selecciona cómo registrar el tiempo.')
-    const log_time = decimalToDuration(input.nonBillable)
-    if (log_time !== '00:00') parts.push({ is_billable: false, log_time })
-  }
+  if (input.notes.length > DESCRIPCION_MAX) throw new Error(`La descripción admite hasta ${DESCRIPCION_MAX} caracteres (es la nota del tiempo en Books). Reduce el texto; no se recortará automáticamente.`)
+  const parts: Array<{ horas: number; facturable: boolean }> = []
+  if (input.mode === 'inicia') parts.push({ horas: rangeToHours(input.start, input.end), facturable: true })
+  else if (input.mode === 'horas') {
+    const billable = parseHours(input.billable)
+    if (billable > 0) parts.push({ horas: billable, facturable: true })
+  } else throw new Error('Selecciona cómo registrar el tiempo.')
+  const nonBillable = parseHours(input.nonBillable)
+  if (nonBillable > 0) parts.push({ horas: nonBillable, facturable: false })
   if (!parts.length) throw new Error('Captura un tiempo mayor que cero.')
-  return [...new Set(input.userIds)].flatMap(userId => parts.map(part => ({
-    project_id: input.projectId!, user_id: userId!, task_name: input.taskName!, log_date: input.date,
-    notes: input.notes, cf_referencia: input.reference, is_billable: true, ...part,
+  return [...new Set(lawyers as number[])].flatMap(abogado_id => parts.map(part => ({
+    abogado_id, proyecto_id, fecha: input.date, descripcion: input.notes.trim(), tarea_estandar_id, ...part,
   })))
 }
 
-export async function postTimeEntry(organizationId: string, payload: TimePayload, timeEntryId?: string): Promise<string> {
+type Uncertain = Error & { uncertain?: boolean }
+const fail = (message: string, uncertain: boolean) => Object.assign(new Error(message), { uncertain }) as Uncertain
+
+export async function saveTiempo(organizationId: string, payload: TiempoPayload | TiempoUpdate, tiempoId?: string): Promise<Tiempo> {
   let response: Response
   try {
-    response = await fetch(`${TIME_ENTRY_API}/${encodeURIComponent(organizationId)}/tiempos${timeEntryId ? `/${encodeURIComponent(timeEntryId)}` : ''}`, {
-      method: timeEntryId ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    response = await fetch(`${TIME_ENTRY_API}/${encodeURIComponent(organizationId)}/tiempos${tiempoId ? `/${encodeURIComponent(tiempoId)}` : ''}`, {
+      method: tiempoId ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       signal: AbortSignal.timeout(180000),
     })
   } catch {
-    throw Object.assign(new Error('Se perdió la respuesta. Revisa Books antes de repetir el guardado.'), { uncertain: true })
+    throw fail('Se perdió la respuesta. Revisa el calendario de tiempos antes de repetir el guardado.', true)
   }
   const data = await response.json().catch(() => null)
-  if (!response.ok || !data?.time_entry?.time_entry_id) {
-    const uncertain = data?.outcome_unknown === true || !data?.stage || (response.ok && !data?.time_entry?.time_entry_id)
-    throw Object.assign(new Error(`${data?.error || 'No se pudo confirmar el guardado.'}${data?.stage ? ` Paso: ${data.stage}.` : ''}${data?.task_created ? ` La tarea ${data.task_id} sí fue creada.` : ''}${uncertain ? ' Revisa Books antes de repetir el guardado.' : ''}`), { uncertain })
+  // Un 4xx sin JSON (p. ej. la función desplegada no tiene la ruta) no se procesó: es reintentable.
+  if (!response.ok && !data && response.status >= 400 && response.status < 500) {
+    throw fail(response.status === 404
+      ? 'La función de Catalyst no tiene esta ruta (HTTP 404). Despliega la versión actual de time_entry_services.'
+      : `El servidor rechazó la petición (HTTP ${response.status}).`, false)
   }
-  if (payload.start_timer && !(String(data.time_entry.timer_started_at || '').trim() || String(data.time_entry.timer_started_at_utc_time || '').trim())) {
-    throw Object.assign(new Error(`El registro ${data.time_entry.time_entry_id} se creó, pero Books no confirmó el inicio del cronómetro. Revisa ese registro en Books antes de guardar nuevamente.`), { uncertain: true })
+  if (!response.ok || !Number.isInteger(data?.id)) {
+    const uncertain = data?.outcome_unknown === true || !data?.stage || (response.ok && !Number.isInteger(data?.id))
+    throw fail(`${data?.error || 'No se pudo confirmar el guardado.'}${uncertain ? ' Revisa el calendario de tiempos antes de repetir el guardado.' : ''}`, uncertain)
   }
-  return String(data.time_entry.time_entry_id)
+  return data as Tiempo
 }
 
-export interface TimeEntryDetail {
-  time_entry_id: string; project_id: string; task_id: string; task_name: string; user_id: string
-  log_date: string; log_time: string; notes: string; is_billable: boolean
-  timer_started_at?: string; timer_started_at_utc_time?: string
-  timesheet_custom_fields?: Array<{ api_name: string; value: string }>
-}
-export async function getTimeEntry(organizationId: string, timeEntryId: string, signal: AbortSignal): Promise<TimeEntryDetail> {
-  if (!/^\d+$/.test(timeEntryId)) throw new Error('El parámetro time_entry_id no es válido.')
-  const response = await fetch(TIME_ENTRY_API + '/' + encodeURIComponent(organizationId) + '/tiempos/' + encodeURIComponent(timeEntryId), { signal })
+export async function getTiempo(organizationId: string, tiempoId: string, signal: AbortSignal): Promise<Tiempo> {
+  if (!/^\d+$/.test(tiempoId)) throw new Error('El parámetro tiempo_id no es válido.')
+  const response = await fetch(`${TIME_ENTRY_API}/${encodeURIComponent(organizationId)}/tiempos/${encodeURIComponent(tiempoId)}`, { signal })
   const data = await response.json().catch(() => null)
-  if (!response.ok || data?.time_entry?.time_entry_id !== timeEntryId) throw new Error(data?.error || 'No se pudo cargar el tiempo. Comprueba que Catalyst esté actualizado.')
-  const entry = data.time_entry
-  if (typeof entry.is_billable !== 'boolean' || !/^\d{2,}:[0-5]\d$/.test(entry.log_time) || !/^\d{4}-\d{2}-\d{2}$/.test(entry.log_date)) throw new Error('El tiempo recibido tiene un formato inesperado.')
-  return entry
+  if (!response.ok || data?.id !== Number(tiempoId)) throw new Error(data?.error || 'No se pudo cargar el tiempo. Comprueba que Catalyst esté actualizado.')
+  if (typeof data.horas !== 'number' || !/^\d{4}-\d{2}-\d{2}$/.test(data.fecha) || !Number.isInteger(data.proyecto_id) || !Number.isInteger(data.abogado_id)) throw new Error('El tiempo recibido tiene un formato inesperado.')
+  return data as Tiempo
+}
+
+// La API rechaza (409) editar lo que ya está en una Prebill o facturado; se avisa antes.
+export function lockReason(tiempo: Pick<Tiempo, 'facturado' | 'prebill_id' | 'status'>): string | null {
+  if (tiempo.facturado === 1 || tiempo.status === 'facturado') return 'Este tiempo ya está facturado y no se puede editar.'
+  if (tiempo.prebill_id != null || tiempo.status === 'en_prebill') return `Este tiempo ya está en la Prebill #${tiempo.prebill_id}. Quítalo de la Prebill para editarlo.`
+  return null
+}
+
+// Aviso cuando ReportesSandbox guardó el tiempo pero no pudo respaldarlo en Books todavía.
+export function backupWarning(saved: Tiempo[]): string {
+  const pending = saved.filter(t => t.books_estado === 'pendiente')
+  if (!pending.length) return ''
+  const reasons = [...new Set(pending.map(t => t.books_error).filter(Boolean))].join(' ')
+  return ` ${pending.length} registro(s) quedaron con respaldo pendiente en Books (se reintenta cada noche)${reasons ? `: ${reasons}` : '.'}`
 }

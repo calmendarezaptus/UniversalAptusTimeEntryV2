@@ -55,6 +55,7 @@ import { format } from 'date-fns'
 import 'animate.css'
 import { StatusModal, type StatusModalType } from '@/components/StatusModal'
 import { Toaster, toast } from 'sonner'
+import { MenuButton } from '@/components/MenuButton'
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
 const THEMES = [
@@ -893,6 +894,7 @@ function App() {
             <div>
               <div className="flex items-center gap-3">
                 <h1 className="text-2xl font-bold text-slate-900 tracking-tight">{editId !== null ? 'Editar tiempo' : 'Registro de Tiempos'}</h1>
+                <MenuButton />
                 <Popover>
                   <PopoverTrigger asChild>
                     <button className="text-slate-400 hover:text-slate-600 transition-colors p-1 rounded-full hover:bg-slate-100 outline-none" title="Configuración de apariencia y lenguaje">
